@@ -1,4 +1,4 @@
-// This implements a 16-bit 48kHz stereo Scream receiver on an esp32-a1s audio kit
+// This implements a 16-bit 48kHz stereo TCP PCM receiver on an esp32-a1s audio kit
 // https://docs.ai-thinker.com/en/esp32-audio-kit
 // Written by Netham45
 
@@ -17,18 +17,20 @@
 #define CHANNELS 2                      // Channels for incoming PCM, non-configurable (Only implements stereo)
 #define VOLUME 1.0f                     // Volume 0.0f-1.0f, distorts at 100%, configurable
 #define PORT 4010                       // TCP port for Scream server data, configurable
-#define INITIAL_BUFFER_SIZE 128         // Number of chunks to be buffered before playback starts, configurable
-#define SOUNDCHIP_PREFEED_SIZE 24       // Number of chunks to be sent to the sound chip once initial buffer is reached, configurable
+#define SERVER "192.168.3.114"          // Scream server IP
+#define INITIAL_BUFFER_SIZE 64          // Number of chunks to be buffered before playback starts, configurable
+#define SOUNDCHIP_PREFEED_SIZE 32       // Number of chunks to be sent to the sound chip once initial buffer is reached, configurable
 #define BUFFER_GROW_STEP_SIZE 8         // Number of chunks to add each underflow, configurable
-#define MAX_BUFFER_SIZE 3000            // Max number of chunks to be buffered before packets are dropped, configurable
+#define MAX_BUFFER_SIZE 128             // Max number of chunks to be buffered before packets are dropped, configurable
 #define CHUNK_SIZE 1152                 // PCM Bytes per chunk, non-configurable (Part of Scream)
 #define HEADER_SIZE 13                  // Scream Header byte size, non-configurable (Part of Scream)
                                         // Samples per chunk
 #define SAMPLES_PER_CHUNK (CHUNK_SIZE / CHANNELS / (BIT_DEPTH / 8))
 #define I2S_AUDIO_TYPE AudioKitEs8388V1 // Type of audio board being used
 
-AsyncUDP udp;                           // PCM UDP handler
+WiFiClient client;                      // PCM TCP handler
 uint64_t received_packets = 0;          // Number of received packets since last buffer fill
+uint64_t played_packets = 0;          // Number of packets sent to audio card
 uint64_t packet_buffer_size = 0;        // Number of packets in ring buffer
 uint64_t packet_buffer_pos = 0;         // Position of ring buffer read head
 bool is_underrun = true;                // True if currently underrun
@@ -41,7 +43,9 @@ hw_timer_t *pcm_timer = timerBegin(SAMPLE_RATE);
                                         // Semaphore to know when loop should process PCM
 volatile SemaphoreHandle_t timer_semaphore = xSemaphoreCreateBinary();
                                         // Audio Out I2S Stream
-uint64_t last_packet_id = 0;
+uint64_t last_packet_id = 0;            // ID of last packet, temp
+                                        // TCP input buffer
+uint8_t in_buffer[CHUNK_SIZE + HEADER_SIZE];
 AudioBoardStream audio_out(I2S_AUDIO_TYPE);
 
 bool push_chunk(uint8_t* chunk) {
@@ -53,14 +57,12 @@ bool push_chunk(uint8_t* chunk) {
   return true;
 }
 
-uint8_t* pop_chunk(uint8_t *buffer=NULL) {
+uint8_t* pop_chunk() {
   if (packet_buffer_size == 0)
     return NULL;
   uint8_t* return_chunk = packet_buffer[packet_buffer_pos];
   packet_buffer_size--;
   packet_buffer_pos = (packet_buffer_pos + 1) % MAX_BUFFER_SIZE;
-  if (buffer)
-    memcpy(buffer, return_chunk, CHUNK_SIZE);
   return return_chunk;
 }
 
@@ -106,23 +108,14 @@ void setup_interrupt() {
   timerAlarm(pcm_timer, SAMPLES_PER_CHUNK, true, NULL);
 }
 
-void IRAM_ATTR receive_pcm(AsyncUDPPacket &packet) {
-  if (packet.length() != CHUNK_SIZE + HEADER_SIZE)
-    return;
-  if (push_chunk(packet.data() + HEADER_SIZE))
-  {
-    if (received_packets <= target_buffer_size)
-      received_packets++;
-  } else {
-    Serial.println("Buffer overflow");
-    packet_buffer_size = target_buffer_size;
-  }
-}
-
 void setup_network() {
   WiFi.begin(WIFI_SSID, WIFI_PSK);
-  udp.onPacket(receive_pcm);
-  udp.listen(PORT);
+  while (!client.connect(SERVER, PORT))
+  {
+    Serial.println("Failed to connect");
+    delay(500);
+  }
+  Serial.println("Connected");
 }
 
 void write_pcm() {  // Process PCM data
@@ -132,6 +125,7 @@ void write_pcm() {  // Process PCM data
       for (int i=0;i<SOUNDCHIP_PREFEED_SIZE;i++) { // Preload the I2S sound card with a couple frames
         data = pop_chunk();
         audio_out.write(data, CHUNK_SIZE);
+        played_packets++;
       }
     }
     is_underrun = false;
@@ -139,9 +133,10 @@ void write_pcm() {  // Process PCM data
   }
   if (!data) {
     if (!is_underrun) {
-      audio_out.writeSilence(CHUNK_SIZE * 5);
+      audio_out.writeSilence(CHUNK_SIZE * 25);
       Serial.println("Buffer underflow");
       received_packets = 0;
+      played_packets = 0;
       target_buffer_size += BUFFER_GROW_STEP_SIZE;
       if (target_buffer_size > MAX_BUFFER_SIZE)
         target_buffer_size = MAX_BUFFER_SIZE;
@@ -149,7 +144,10 @@ void write_pcm() {  // Process PCM data
     is_underrun = true;
   }
   if (!is_underrun)
+  {
     audio_out.write(data, CHUNK_SIZE);
+    played_packets++;
+  }
 }
 
 void setup() {  // Set up I2S sound card and pcm timer and network
@@ -158,6 +156,33 @@ void setup() {  // Set up I2S sound card and pcm timer and network
   setup_audio();
   setup_interrupt();
   setup_network();
+  xTaskCreatePinnedToCore(tcp_handler, "tcp_handler", 2048, NULL, 1, NULL, 1);
+}
+
+void tcp_handler(void *) {
+  while(client.connected())
+  {
+    if (client.available() >= CHUNK_SIZE + HEADER_SIZE) {
+      client.readBytes(in_buffer, CHUNK_SIZE + HEADER_SIZE);
+      uint64_t *new_packet_id = (uint64_t*)(in_buffer + 5);
+      if (*new_packet_id != last_packet_id + 1) {
+        Serial.print("Got non-sequential packet ids ");
+        Serial.print(last_packet_id);
+        Serial.print(" -> ");
+        Serial.println(*new_packet_id);
+      }
+      last_packet_id = *new_packet_id;
+      if (push_chunk(in_buffer + HEADER_SIZE)) {
+        //if (received_packets <= target_buffer_size)
+        received_packets++;
+      } else {
+        Serial.println("Buffer overflow, dropping some audio.");
+        packet_buffer_size = target_buffer_size;
+      }
+    } else
+      delay(2);
+  }
+  ESP.restart();
 }
 
 void loop() {
@@ -165,4 +190,6 @@ void loop() {
     sleep();
   if (xSemaphoreTake(timer_semaphore, NULL) == pdTRUE)
     write_pcm();
+  else
+    delay(4);
 }
