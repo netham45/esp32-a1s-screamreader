@@ -19,6 +19,7 @@
 #define PORT 4010                  // TCP port for Scream server data, configurable
 #define SERVER "192.168.3.114"     // Scream server IP
 #define INITIAL_BUFFER_SIZE 8      // Number of chunks to be buffered before playback starts, configurable
+#define SOUNDCHIP_PREFEED_SIZE 8   // Number of chunks to be sent to the sound chip once initial buffer is reached, configurable
 #define BUFFER_GROW_STEP_SIZE 8    // Number of chunks to add each underflow, configurable
 #define MAX_BUFFER_SIZE 3200       // Max number of chunks to be buffered before packets are dropped, configurable
 #define CHUNK_SIZE 1152            // PCM Bytes per chunk, non-configurable (Part of Scream)
@@ -28,11 +29,9 @@
                                    // Samples per chunk
 #define SAMPLES_PER_CHUNK (CHUNK_SIZE / CHANNELS / (BIT_DEPTH / 8))
 #define I2S_AUDIO_TYPE AudioKitEs8388V1  // Type of audio board being used
-//#define USE_SECOND_RAM_BUFFER 1 // Use RAM buffer, there's a clicking noise every once in a while without this
-#if MAX_BUFFER_SIZE <= 128
-#undef USE_SECOND_RAM_BUFFER
-#endif
-#ifdef USE_SECOND_RAM_BUFFER
+//#define USE_RAM_BUFFER 1 // Use RAM buffer, there's a clicking noise every once in a while without this
+
+#ifdef USE_RAM_BUFFER
 #if (MAX_BUFFER_SIZE % RAM_BUFFER_CHUNK_COUNT != 0)
 #error "MAX_BUFFER_SIZE must be a multiple of RAM_BUFFER_CHUNK_COUNT
 #endif
@@ -40,6 +39,7 @@
 
 WiFiClient client;                // PCM TCP handler
 uint64_t received_packets = 0;    // Number of received packets since last buffer fill
+uint64_t played_packets = 0;      // Number of packets sent to audio card
 uint64_t packet_buffer_size = 0;  // Number of packets in ring buffer
 uint64_t packet_buffer_pos = 0;   // Position of ring buffer read head
 bool is_underrun = true;          // True if currently underrun
@@ -53,7 +53,6 @@ uint64_t last_packet_id = 0;  // ID of last packet, temp
 uint8_t in_buffer[CHUNK_SIZE + HEADER_SIZE];
 AudioBoardStream audio_out(I2S_AUDIO_TYPE);
 
-#ifdef USE_SECOND_RAM_BUFFER
 uint8_t* ram_buffer_1[RAM_BUFFER_CHUNK_COUNT] = { 0 };
 uint8_t* ram_buffer_2[RAM_BUFFER_CHUNK_COUNT] = { 0 };
 uint8_t active_ram_buffer = 1;
@@ -61,7 +60,6 @@ uint8_t last_filled_ram_buffer = 0;
 bool ram_buffer_1_empty = true;
 bool ram_buffer_2_empty = true;
 uint64_t ram_buffer_pos = 0;
-#endif
 
 portMUX_TYPE buffer_mutex = portMUX_INITIALIZER_UNLOCKED;
 
@@ -78,12 +76,16 @@ bool IRAM_ATTR push_chunk(uint8_t *chunk) {
   return true;
 }
 
-void IRAM_ATTR set_underrun() {
+uint8_t *IRAM_ATTR pop_chunk() {
+  taskENTER_CRITICAL(&buffer_mutex);
+  if (packet_buffer_size == 0){
+#ifndef USE_RAM_BUFFER
     Serial.println("Tried to pop from buffer, but it's empty.");
     if (!is_underrun) {
-      audio_out.writeSilence(CHUNK_SIZE * 25);
+
       Serial.println("Buffer underflow");
       received_packets = 0;
+      played_packets = 0;
       target_buffer_size += BUFFER_GROW_STEP_SIZE;
       if (target_buffer_size >= MAX_BUFFER_SIZE) {
         Serial.println("Buffer at MAX_BUFFER_SIZE");
@@ -91,10 +93,21 @@ void IRAM_ATTR set_underrun() {
       }
     }
     is_underrun = true;
+#endif
+    taskEXIT_CRITICAL(&buffer_mutex);
+    return NULL;
+  }
+  uint8_t *return_chunk = packet_buffer[packet_buffer_pos];
+  packet_buffer_size--;
+  packet_buffer_pos = (packet_buffer_pos + 1) % MAX_BUFFER_SIZE;
+  taskEXIT_CRITICAL(&buffer_mutex);
+  return return_chunk;
 }
 
-#ifdef USE_SECOND_RAM_BUFFER
 void IRAM_ATTR buffer_load() {
+#ifndef USE_RAM_BUFFER
+  return;
+#endif
   taskENTER_CRITICAL(&buffer_mutex);
   if (ram_buffer_1_empty && packet_buffer_size >= RAM_BUFFER_CHUNK_COUNT && !last_filled_ram_buffer) {
     packet_buffer_pos = (packet_buffer_pos + RAM_BUFFER_CHUNK_COUNT) % MAX_BUFFER_SIZE;
@@ -113,29 +126,27 @@ void IRAM_ATTR buffer_load() {
   }
   taskEXIT_CRITICAL(&buffer_mutex);
 }
-#endif
 
-uint8_t IRAM_ATTR *pop_chunk() {
-  taskENTER_CRITICAL(&buffer_mutex);
-
-#ifndef USE_SECOND_RAM_BUFFER
-
-  if (packet_buffer_size == 0) {
-    taskEXIT_CRITICAL(&buffer_mutex);
-    set_underrun();
-    return NULL;
-  }
-  uint8_t *return_chunk = packet_buffer[packet_buffer_pos];
-  packet_buffer_size--;
-  packet_buffer_pos = (packet_buffer_pos + 1) % MAX_BUFFER_SIZE;
-  taskEXIT_CRITICAL(&buffer_mutex);
-  return return_chunk;
-
+uint8_t IRAM_ATTR *pop_ram_chunk() {
+#ifndef USE_RAM_BUFFER
+  return pop_chunk();
 #else
-
+  taskENTER_CRITICAL(&buffer_mutex);
   if (ram_buffer_1_empty && ram_buffer_2_empty) {
+    Serial.println("Tried to pop from ram buffer, but it's empty.");
+    if (!is_underrun) {
+      audio_out.writeSilence(CHUNK_SIZE * 25);
+      Serial.println("Buffer underflow");
+      received_packets = 0;
+      played_packets = 0;
+      target_buffer_size += BUFFER_GROW_STEP_SIZE;
+      if (target_buffer_size >= MAX_BUFFER_SIZE) {
+        Serial.println("Buffer at MAX_BUFFER_SIZE");
+        target_buffer_size = MAX_BUFFER_SIZE;
+      }
+    }
+    is_underrun = true;
     taskEXIT_CRITICAL(&buffer_mutex);
-    set_underrun();
     return NULL;
   }
 
@@ -152,7 +163,6 @@ uint8_t IRAM_ATTR *pop_chunk() {
   }
   taskEXIT_CRITICAL(&buffer_mutex);
   return ram_buffer[orig_ram_buffer_pos];
-
 #endif
 }
 
@@ -164,7 +174,7 @@ void sleep() {
 
 void setup_audio_buffers() {
   Serial.println("Allocating buffer");
-#ifdef USE_SECOND_RAM_BUFFER
+#ifdef USE_RAM_BUFFER
   uint8_t* _ram_buffer_1 = 0;
   _ram_buffer_1 = (uint8_t*)malloc(CHUNK_SIZE * RAM_BUFFER_CHUNK_COUNT);
   memset(_ram_buffer_1, 0, CHUNK_SIZE * RAM_BUFFER_CHUNK_COUNT);
@@ -179,11 +189,7 @@ void setup_audio_buffers() {
 #endif
 
   uint8_t* buffer = 0;
-#if MAX_BUFFER_SIZE > 128
   buffer = (uint8_t*)ps_malloc(CHUNK_SIZE * MAX_BUFFER_SIZE);
-#else
-  buffer = (uint8_t*)malloc(CHUNK_SIZE * MAX_BUFFER_SIZE);
-#endif
   memset(buffer, 0, CHUNK_SIZE * MAX_BUFFER_SIZE);
   for (int i = 0; i < MAX_BUFFER_SIZE; i++)
     packet_buffer[i] = (uint8_t*)buffer + i * CHUNK_SIZE;
@@ -217,10 +223,21 @@ void setup_network() {
 
 void IRAM_ATTR write_pcm() {  // Process PCM data
   uint8_t *data = 0;
-  if (received_packets > target_buffer_size)
+  if (received_packets > target_buffer_size) {
+    if (is_underrun) {
+      for (int i = 0; i < SOUNDCHIP_PREFEED_SIZE; i++) {  // Preload the I2S sound card with a couple frames
+        data = pop_ram_chunk();
+        audio_out.write(data, CHUNK_SIZE);
+        played_packets++;
+      }
+    }
     is_underrun = false;
-  if (!is_underrun)
-    audio_out.write(pop_chunk(), CHUNK_SIZE);
+    data = pop_ram_chunk();
+  }
+  if (!is_underrun) {
+    audio_out.write(data, CHUNK_SIZE);
+    played_packets++;
+  }
 }
 
 void IRAM_ATTR tcp_handler(void *) {
@@ -248,7 +265,7 @@ void IRAM_ATTR tcp_handler(void *) {
   ESP.restart();
 }
 
-#ifdef USE_SECOND_RAM_BUFFER
+#ifdef USE_RAM_BUFFER
 void IRAM_ATTR buffer_feeder(void *) {
   while(true) {
     buffer_load();
@@ -263,7 +280,7 @@ void setup() {  // Set up I2S sound card and network
   setup_audio();
   setup_network();
   xTaskCreatePinnedToCore(tcp_handler, "tcp_handler", 2048, NULL, 1, NULL, 1);
-#ifdef USE_SECOND_RAM_BUFFER
+#ifdef USE_RAM_BUFFER
   xTaskCreatePinnedToCore(buffer_feeder, "buffer_feeder", 2048, NULL, 0, NULL, 0);
 #endif
 }
