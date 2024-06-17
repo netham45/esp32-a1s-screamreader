@@ -2,14 +2,14 @@
 // TCP port for Scream server data, configurable
 const uint16_t  PORT                  = 4010;
 // Scream server IP, configurable
-#define         SERVER                "192.168.3.114"
+constexpr char* SERVER                = "192.168.3.114";
 
 // Number of chunks to be buffered before playback starts, configurable
-const uint16_t  INITIAL_BUFFER_SIZE   = 8;
+const uint16_t  INITIAL_BUFFER_SIZE   = 644;
 // Number of chunks to add each underflow, configurable
-const uint16_t  BUFFER_GROW_STEP_SIZE = 8;
+const uint16_t  BUFFER_GROW_STEP_SIZE = 16;
 // Max number of chunks to be buffered before packets are dropped, configurable
-const uint16_t  MAX_BUFFER_SIZE       = 3200;
+const uint16_t  MAX_BUFFER_SIZE       = 512;
 
 // Sample rate for incoming PCM, configurable
 const uint32_t  SAMPLE_RATE                    = 48000;

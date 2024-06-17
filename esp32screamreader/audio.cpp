@@ -4,11 +4,11 @@
 #include "AudioLibs/AudioBoardStream.h"
 
 // Type of audio board being used
-#define I2S_AUDIO_TYPE AudioKitEs8388V1
+audio_driver::AudioBoard I2S_AUDIO_TYPE = AudioKitEs8388V1;
 // Channels for incoming PCM, non-configurable (Only implements stereo)
-const uint8_t CHANNELS           = 2;
+const uint8_t  CHANNELS                 = 2;
  // Samples per chunk
-const uint16_t SAMPLES_PER_CHUNK = (PCM_CHUNK_SIZE / CHANNELS / (BIT_DEPTH / 8));
+const uint16_t SAMPLES_PER_CHUNK        = (PCM_CHUNK_SIZE / CHANNELS / (BIT_DEPTH / 8));
 
 AudioBoardStream audio_out(I2S_AUDIO_TYPE);
 bool is_silent = true;
@@ -21,7 +21,7 @@ void IRAM_ATTR pcm_handler(void*) {
         audio_out.write(data, PCM_CHUNK_SIZE); 
         is_silent = false;
       } else if (!is_silent) {
-        audio_out.writeSilence(PCM_CHUNK_SIZE * 16);
+        audio_out.writeSilence(PCM_CHUNK_SIZE * 24);
         is_silent = true;
       }
     }

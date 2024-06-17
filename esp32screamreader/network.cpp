@@ -3,16 +3,25 @@
 #include "global.hpp"
 #include "buffer.hpp"
 
-//#define USE_TCP // Uncomment to use TCP, comment to use UDP
+bool use_tcp = false; // Uncomment to use TCP, comment to use UDP
 
-const uint8_t HEADER_SIZE = 5;                         // Scream Header byte size, non-configurable (Part of Scream)
-const uint8_t PACKET_SIZE = PCM_CHUNK_SIZE + HEADER_SIZE;
+const uint16_t HEADER_SIZE = 5;                         // Scream Header byte size, non-configurable (Part of Scream)
+const uint16_t PACKET_SIZE = PCM_CHUNK_SIZE + HEADER_SIZE;
 
 WiFiClient tcp;                               // PCM TCP handler
-AsyncUDP udp;                                 // PCM UDP handler
-uint8_t in_buffer[PACKET_SIZE];  // TCP input buffer
+WiFiUDP udp;                                  // PCM UDP handler
 
 void IRAM_ATTR tcp_handler(void *) {
+  uint8_t in_buffer[PACKET_SIZE];  // TCP input buffer
+  int connect_failure = 0;
+  Serial.println("Connecting to ScreamRouter");
+  while (!tcp.connect(SERVER, PORT)) {
+    Serial.println("Failed to connect");
+    delay(250);
+    if (connect_failure++ >= 50)
+      ESP.restart();
+  }
+  Serial.println("Connected to ScreamRouter");
   while (tcp.connected()) {
     if (tcp.available() >= PACKET_SIZE) {
       tcp.readBytes(in_buffer, PACKET_SIZE);
@@ -23,24 +32,17 @@ void IRAM_ATTR tcp_handler(void *) {
   ESP.restart();
 }
 
-void setup_tcp() {
-  Serial.println("Connecting to ScreamRouter");
-  int connect_failure = 0;
-  while (!tcp.connect(SERVER, PORT)) {
-    Serial.println("Failed to connect");
-    delay(250);
-    if (connect_failure++ >= 50)
-      ESP.restart();
+void IRAM_ATTR udp_handler(void *) {
+  uint8_t in_buffer[PACKET_SIZE];  // TCP input buffer
+  udp.begin(PORT);
+  while (true) {
+    int bytes = udp.parsePacket();
+    if (bytes >= PACKET_SIZE) {
+      udp.read(in_buffer, PACKET_SIZE);
+      push_chunk(in_buffer + HEADER_SIZE);
+    }
+    delay(1);
   }
-  Serial.println("Connected to ScreamRouter");
-  xTaskCreatePinnedToCore(tcp_handler, "tcp_handler", 2048, NULL, 1, NULL, 0);
-}
-
-void setup_udp() {
-  udp.listen(PORT);
-  udp.onPacket([](AsyncUDPPacket packet) {
-    push_chunk(packet.data() + HEADER_SIZE);
-  });
 }
 
 void setup_network() {
@@ -55,10 +57,8 @@ void setup_network() {
     Serial.println("Failed to connect to wifi");
     ESP.restart();
   }
-#ifdef USE_TCP
-  setup_tcp();
-#else
-  setup_udp();
-#endif
-
+  if (use_tcp)
+    xTaskCreatePinnedToCore(tcp_handler, "tcp_handler", PACKET_SIZE + 2048, NULL, 1, NULL, 0);
+  else
+    xTaskCreatePinnedToCore(udp_handler, "udp_handler", PACKET_SIZE + 2048, NULL, 1, NULL, 0);
 }
